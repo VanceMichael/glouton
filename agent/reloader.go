@@ -55,8 +55,7 @@ var (
 type ReloadState interface {
 	Bleemeo() bleemeoTypes.BleemeoReloadState
 	MQTT() types.MQTTReloadState
-	LocalStore() *tsdb.Store
-	SetLocalStore(store *tsdb.Store)
+	LocalStore() *tsdb.Manager
 	DiagnosticArchive(ctx context.Context, archive types.ArchiveWriter) error
 	WatcherError() error
 	ReloadError() error
@@ -66,7 +65,7 @@ type ReloadState interface {
 type reloadState struct {
 	bleemeo    bleemeoTypes.BleemeoReloadState
 	mqtt       types.MQTTReloadState
-	localStore *tsdb.Store
+	localStore *tsdb.Manager
 
 	l             sync.Mutex
 	watcherError  error
@@ -180,33 +179,19 @@ func (rs *reloadState) setLastReloadDate(lastReload time.Time) {
 	rs.lastReload = lastReload
 }
 
-func (rs *reloadState) LocalStore() *tsdb.Store {
+func (rs *reloadState) LocalStore() *tsdb.Manager {
 	rs.l.Lock()
 	defer rs.l.Unlock()
 
 	return rs.localStore
 }
 
-func (rs *reloadState) SetLocalStore(s *tsdb.Store) {
-	rs.l.Lock()
-	defer rs.l.Unlock()
-
-	rs.localStore = s
-}
-
 func (rs *reloadState) Close() {
 	rs.bleemeo.Close()
 	rs.mqtt.Close()
 
-	rs.l.Lock()
-	store := rs.localStore
-	rs.localStore = nil
-	rs.l.Unlock()
-
-	if store != nil {
-		if err := store.Close(); err != nil {
-			logger.V(1).Printf("local TSDB close: %v", err)
-		}
+	if err := rs.localStore.Close(); err != nil {
+		logger.V(1).Printf("local TSDB manager close: %v", err)
 	}
 }
 
@@ -238,8 +223,9 @@ func StartReloadManager(configFilesFromFlag []string, reloadDisabled bool) error
 		agentIsRunning:      false,
 		configFilesFromFlag: configFilesFromFlag,
 		reloadState: &reloadState{
-			bleemeo: bleemeo.NewReloadState(),
-			mqtt:    client.NewReloadState(),
+			bleemeo:    bleemeo.NewReloadState(),
+			mqtt:       client.NewReloadState(),
+			localStore: tsdb.NewManager(),
 		},
 	}
 

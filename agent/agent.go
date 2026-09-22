@@ -805,7 +805,9 @@ func (a *agent) run(ctx context.Context, sighupChan chan os.Signal) { //nolint:m
 
 	a.store = store.New("agent store", 3*time.Minute, 2*time.Hour)
 
-	a.setupLocalTSDB()
+	if err := a.setupLocalTSDB(); err != nil {
+		a.addWarnings(fmt.Errorf("local_store: %w", err))
+	}
 
 	bleemeoFilteredStore := store.NewFilteredStore(
 		a.store,
@@ -827,8 +829,10 @@ func (a *agent) run(ctx context.Context, sighupChan chan os.Signal) { //nolint:m
 	secretInputsGate := gate.New(inputs.MaxParallelSecrets())
 
 	var pushPoint types.PointPusher = a.store
-	if localTSDB := a.reloadState.LocalStore(); localTSDB != nil {
-		pushPoint = teePointPusher{primary: a.store, secondary: localTSDB}
+
+	localTSDBManager := a.reloadState.LocalStore()
+	if localTSDBManager.DesiredEnabled() {
+		pushPoint = teePointPusher{primary: a.store, secondary: localTSDBManager}
 	}
 
 	a.gathererRegistry, err = registry.New(
@@ -998,9 +1002,9 @@ func (a *agent) run(ctx context.Context, sighupChan chan os.Signal) { //nolint:m
 
 	var localStoreInfo api.LocalStoreInfo
 
-	if localTSDB := a.reloadState.LocalStore(); localTSDB != nil {
-		apiDB = api.NewQueryableWithSecondary(a.store, localTSDB, a.BleemeoAgentID)
-		localStoreInfo = localTSDB
+	if localTSDBManager.DesiredEnabled() {
+		apiDB = api.NewQueryableWithSecondary(a.store, localTSDBManager, a.BleemeoAgentID)
+		localStoreInfo = localTSDBManager
 	}
 
 	// Pass the blackbox manager as the monitors source when present.
@@ -2444,8 +2448,8 @@ func (a *agent) writeDiagnosticArchive(ctx context.Context, archive types.Archiv
 		modules = append(modules, a.bleemeoConnector.DiagnosticArchive)
 	}
 
-	if localTSDB := a.reloadState.LocalStore(); localTSDB != nil {
-		modules = append(modules, localTSDB.DiagnosticArchive)
+	if localTSDBManager := a.reloadState.LocalStore(); localTSDBManager.DesiredEnabled() {
+		modules = append(modules, localTSDBManager.DiagnosticArchive)
 	}
 
 	if a.monitorManager != nil {

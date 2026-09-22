@@ -67,6 +67,13 @@ type agentInterface interface {
 // present. The API exposes this so the UI can decide which time-range
 // buttons to enable.
 type LocalStoreInfo interface {
+	// State returns the lifecycle state of the current TSDB generation:
+	// "healthy", "recovering" or "failed" ("disabled" before Apply).
+	State() string
+	// Persistent reports whether a generation currently serves
+	// persistent history (healthy, or a retained generation while
+	// recovering from a failed reload).
+	Persistent() bool
 	// Retention returns how far back the store is configured to keep data.
 	Retention() time.Duration
 	// OldestPointMs returns the timestamp (ms since epoch) of the

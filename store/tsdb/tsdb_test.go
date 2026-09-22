@@ -61,7 +61,9 @@ func TestRoundTrip(t *testing.T) {
 		},
 	}
 
-	store.PushPoints(context.Background(), points)
+	if err := store.PushPoints(context.Background(), points); err != nil {
+		t.Fatalf("PushPoints: %v", err)
+	}
 
 	q, err := store.Querier(now.Add(-5*time.Minute).UnixMilli(), now.Add(time.Minute).UnixMilli())
 	if err != nil {
@@ -113,12 +115,14 @@ func TestPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	store.PushPoints(context.Background(), []types.MetricPoint{
+	if err := store.PushPoints(context.Background(), []types.MetricPoint{
 		{
 			Point:  types.Point{Time: now, Value: 42},
 			Labels: map[string]string{labelName: "x"},
 		},
-	})
+	}); err != nil {
+		t.Fatalf("PushPoints: %v", err)
+	}
 
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -188,12 +192,14 @@ func TestPushPointsSkipsNaN(t *testing.T) {
 
 	now := time.Now()
 
-	store.PushPoints(context.Background(), []types.MetricPoint{
+	if err := store.PushPoints(context.Background(), []types.MetricPoint{
 		{
 			Point:  types.Point{Time: now, Value: nanFloat()},
 			Labels: map[string]string{labelName: "y"},
 		},
-	})
+	}); err != nil {
+		t.Fatalf("PushPoints: %v", err)
+	}
 
 	q, err := store.Querier(now.Add(-time.Minute).UnixMilli(), now.Add(time.Minute).UnixMilli())
 	if err != nil {
@@ -214,6 +220,32 @@ func nanFloat() float64 {
 	zero := 0.0
 
 	return zero / zero
+}
+
+// TestPushPointsAfterClose checks that a write attempted on a closed
+// store returns errStoreClosed instead of being silently accepted.
+func TestPushPointsAfterClose(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := Open(Options{Path: dir, Retention: 24 * time.Hour})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	now := time.Now()
+
+	err = store.PushPoints(context.Background(), []types.MetricPoint{{
+		Point:  types.Point{Time: now, Value: 1},
+		Labels: map[string]string{labelName: "z"},
+	}})
+
+	if !errors.Is(err, errStoreClosed) {
+		t.Errorf("PushPoints after Close: %v, want errStoreClosed", err)
+	}
 }
 
 // TestCloseDuringUse checks that closing the store while it is used doesn't
@@ -241,7 +273,10 @@ func TestCloseDuringUse(t *testing.T) {
 	for range 4 {
 		wg.Go(func() {
 			for range 50 {
-				store.PushPoints(context.Background(), points)
+				if err := store.PushPoints(context.Background(), points); err != nil && !errors.Is(err, errStoreClosed) {
+					t.Errorf("PushPoints: %v", err)
+				}
+
 				store.OldestPointMs()
 
 				querier, err := store.Querier(now.UnixMilli()-1000, now.UnixMilli())

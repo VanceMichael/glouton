@@ -478,9 +478,13 @@ func (d *Data) AgentInformation(w http.ResponseWriter, r *http.Request) {
 // StoreInfo describes the available local history depth so the UI can
 // gate time-range buttons on what is actually queryable.
 type StoreInfo struct {
-	Persistent       bool  `json:"persistent"`
-	RetentionSeconds int64 `json:"retention_seconds"`
-	OldestPointMs    int64 `json:"oldest_point_ms"`
+	// State is the lifecycle state of the TSDB generation: "healthy",
+	// "recovering" or "failed". Empty when local persistence is not
+	// wanted (the panel falls back to the in-memory window).
+	State            string `json:"state"`
+	Persistent       bool   `json:"persistent"`
+	RetentionSeconds int64  `json:"retention_seconds"`
+	OldestPointMs    int64  `json:"oldest_point_ms"`
 }
 
 // Render is a no-op required by go-chi/render.
@@ -648,17 +652,22 @@ func (d *Data) Config(w http.ResponseWriter, _ *http.Request) {
 // StoreInfo returns metadata about the local metric store.
 func (d *Data) StoreInfo(w http.ResponseWriter, r *http.Request) {
 	info := StoreInfo{
+		State:            "",
 		Persistent:       false,
 		RetentionSeconds: int64(inMemoryRetention.Seconds()),
 		OldestPointMs:    time.Now().Add(-inMemoryRetention).UnixMilli(),
 	}
 
 	if ls := d.api.LocalStore; ls != nil {
-		info.Persistent = true
+		info.State = ls.State()
 		info.RetentionSeconds = int64(ls.Retention().Seconds())
 
-		if oldest := ls.OldestPointMs(); oldest > 0 {
-			info.OldestPointMs = oldest
+		if ls.Persistent() {
+			info.Persistent = true
+
+			if oldest := ls.OldestPointMs(); oldest > 0 {
+				info.OldestPointMs = oldest
+			}
 		}
 	}
 

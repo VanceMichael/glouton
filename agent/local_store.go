@@ -20,20 +20,23 @@ import (
 	"context"
 	"path/filepath"
 
-	"github.com/bleemeo/glouton/logger"
 	"github.com/bleemeo/glouton/store/tsdb"
 	"github.com/bleemeo/glouton/types"
 )
 
-// setupLocalTSDB opens the on-disk TSDB if the resolved local_store policy
-// says so. The handle is cached in the reloadState so subsequent reloads reuse
-// it without replaying the WAL, unless the configuration changed: the store is
-// then closed, and re-opened with the new settings if it's still enabled.
+// setupLocalTSDB applies the resolved local_store policy to the TSDB
+// manager held by the reload state. The manager owns the current (and any
+// recovered) generation across reloads.
 //
 // Resolution rule: an explicit agent.local_store.enable always wins;
 // when unset, the store is enabled iff bleemeo.enable is false (i.e.
 // when no SaaS backend will retain data, persist locally by default).
-func (a *agent) setupLocalTSDB() {
+//
+// The new policy is only committed once the candidate TSDB opened and
+// the generation switch completed: when the open fails, the previous
+// still-usable generation is retained or the manager enters recovery.
+// The returned error is surfaced as a configuration warning.
+func (a *agent) setupLocalTSDB() error {
 	cfg := a.config.Agent.LocalStore
 
 	enabled := !a.config.Bleemeo.Enable
@@ -46,46 +49,16 @@ func (a *agent) setupLocalTSDB() {
 		path = filepath.Join(a.stateDir, "tsdb")
 	}
 
-	retention := cfg.Retention
-
-	// The previous store is only kept when its settings still match the
-	// configuration, otherwise a reload couldn't disable it nor change its
-	// path or its retention.
-	if previous := a.reloadState.LocalStore(); previous != nil {
-		if enabled && previous.Path() == path && (retention <= 0 || previous.Retention() == retention) {
-			return
-		}
-
-		a.reloadState.SetLocalStore(nil)
-
-		if err := previous.Close(); err != nil {
-			logger.V(1).Printf("Failed to close the local TSDB at %s: %v", previous.Path(), err)
-		}
-	}
-
-	if !enabled {
-		return
-	}
-
-	store, err := tsdb.Open(tsdb.Options{
+	return a.reloadState.LocalStore().Apply(enabled, tsdb.Options{
 		Path:      path,
-		Retention: retention,
+		Retention: cfg.Retention,
 	})
-	if err != nil {
-		logger.Printf("Local TSDB unavailable, continuing without on-disk metric persistence: %v", err)
-
-		return
-	}
-
-	a.reloadState.SetLocalStore(store)
-
-	logger.V(0).Printf("Local TSDB enabled at %s (retention %s)", path, store.Retention())
 }
 
 // teePointPusher forwards every PushPoints call to two underlying
 // pushers. It is used to mirror the registry output to both the
-// in-memory store (consumed by the Bleemeo connector) and the on-disk
-// TSDB (consumed by the local API).
+// in-memory store (consumed by the Bleemeo connector) and the local TSDB
+// manager (consumed by the local API).
 type teePointPusher struct {
 	primary   types.PointPusher
 	secondary types.PointPusher
