@@ -276,14 +276,34 @@ type NRPE struct {
 }
 
 type OpenSourceMQTT struct {
-	Enable      bool     `yaml:"enable"`
-	Username    string   `yaml:"username"`
-	Password    string   `yaml:"password"`
-	CAFile      string   `yaml:"ca_file"`
-	Hosts       []string `yaml:"hosts"`
-	Port        int      `yaml:"port"`
-	SSLInsecure bool     `yaml:"ssl_insecure"`
-	SSL         bool     `yaml:"ssl"`
+	Enable      bool      `yaml:"enable"`
+	Username    string    `yaml:"username"`
+	Password    string    `yaml:"password"`
+	CAFile      string    `yaml:"ca_file"`
+	Hosts       []string  `yaml:"hosts"`
+	Port        int       `yaml:"port"`
+	SSLInsecure bool      `yaml:"ssl_insecure"`
+	SSL         bool      `yaml:"ssl"`
+	Spool       MQTTSpool `yaml:"spool"`
+}
+
+// MQTTSpool configures the optional persistent pending-message queue stored
+// under the agent state directory. When disabled (the default) MQTT messages
+// are only kept in memory.
+type MQTTSpool struct {
+	// Enable turns on disk persistence of retryable messages until the broker acknowledges them.
+	Enable bool `yaml:"enable"`
+	// MaxSizeMB is the maximum live (unacknowledged) size of the queue in MiB.
+	// Zero or negative values fall back to DefaultMQTTSpoolMaxSizeMB.
+	MaxSizeMB int `yaml:"max_size_mb"`
+	// MaxAge defines how long an unacknowledged message is kept before being evicted.
+	// Zero disables age-based eviction. Negative values fall back to the default.
+	MaxAge time.Duration `yaml:"max_age"`
+}
+
+// MaxSizeBytes converts the MiB limit to bytes.
+func (s MQTTSpool) MaxSizeBytes() int64 {
+	return int64(s.MaxSizeMB) * 1024 * 1024
 }
 
 type Logging struct {
@@ -356,11 +376,12 @@ type Sentry struct {
 }
 
 type BleemeoMQTT struct {
-	CAFile      string `yaml:"cafile"`
-	Host        string `yaml:"host"`
-	Port        int    `yaml:"port"`
-	SSLInsecure bool   `yaml:"ssl_insecure"`
-	SSL         bool   `yaml:"ssl"`
+	CAFile      string    `yaml:"cafile"`
+	Host        string    `yaml:"host"`
+	Port        int       `yaml:"port"`
+	SSLInsecure bool      `yaml:"ssl_insecure"`
+	SSL         bool      `yaml:"ssl"`
+	Spool       MQTTSpool `yaml:"spool"`
 }
 
 type Blackbox struct {

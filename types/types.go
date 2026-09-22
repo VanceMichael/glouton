@@ -576,7 +576,7 @@ type MQTTReloadState interface {
 	OnConnectionLost(cli paho.Client, err error)
 	ConnectionLostChannel() <-chan error
 	Close()
-	AddPendingMessage(ctx context.Context, m Message, shouldWait bool) bool
+	AddPendingMessage(ctx context.Context, m Message, shouldWait bool) (enqueued bool)
 	PendingMessage(ctx context.Context) (Message, bool)
 	PendingMessagesCount() int
 }
@@ -587,6 +587,13 @@ type Message struct {
 	Retry   bool
 	Topic   string
 	Payload []byte
+	// SpoolSeq is the persistent spool sequence number of a retryable
+	// message; zero means the message is only held in memory (spool disabled
+	// or persistence degraded after a write failure).
+	SpoolSeq uint64
+	// EnqueuedAt is when the message entered the pending queue; the spool uses
+	// it to apply the retention limit.
+	EnqueuedAt time.Time
 }
 
 // SimpleRule is a PromQL run on output from the Gatherer.

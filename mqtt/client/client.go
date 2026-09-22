@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bleemeo/glouton/crashreport"
@@ -79,6 +80,9 @@ type Client struct {
 	consecutiveErrors   int
 	lastReport          time.Time
 	disabledUntil       time.Time
+	// spoolEncodeFailures counts payloads that could not be encoded and were
+	// never handed to the spool or paho; exposed in the spool diagnostic file.
+	spoolEncodeFailures atomic.Int64
 }
 
 type Options struct {
@@ -93,6 +97,12 @@ type Options struct {
 	// A unique identifier for this client.
 	ID                  string
 	PahoLastPingCheckAt func() time.Time
+	// SpoolEnabled turns on the persistent pending-message queue for retryable
+	// messages; spool files live under SpoolDirectory in an mqtt-spool subfolder.
+	SpoolEnabled   bool
+	SpoolDirectory string
+	SpoolMaxSize   int64
+	SpoolMaxAge    time.Duration
 }
 
 // New creates a new client.
@@ -104,6 +114,16 @@ func New(opts Options) *Client {
 		disableNotify:  make(chan any),
 		connectionLost: make(chan any),
 		encoder:        &encoder{},
+	}
+
+	if rs, ok := opts.ReloadState.(*ReloadState); ok {
+		rs.ApplySpool(SpoolConfig{
+			Enabled:      opts.SpoolEnabled,
+			Name:         spoolNameFromID(opts.ID),
+			Directory:    opts.SpoolDirectory,
+			MaxSizeBytes: opts.SpoolMaxSize,
+			MaxAge:       opts.SpoolMaxAge,
+		})
 	}
 
 	return client
@@ -134,6 +154,12 @@ func (c *Client) Run(ctx context.Context) {
 		defer crashreport.ProcessPanic()
 
 		c.receiveEvents(ctx)
+	})
+
+	wg.Go(func() {
+		defer crashreport.ProcessPanic()
+
+		c.spoolFeeder(ctx)
 	})
 
 	wg.Wait()
@@ -168,6 +194,7 @@ func (c *Client) PublishAsJSON(topic string, payload any, retry bool) error {
 	payloadBuffer, err := c.encoder.EncodeObject(payload)
 	if err != nil {
 		c.encoder.PutBuffer(payloadBuffer)
+		c.spoolEncodeFailures.Add(1)
 
 		return err
 	}
@@ -182,6 +209,7 @@ func (c *Client) PublishBytes(ctx context.Context, topic string, payload []byte,
 	payloadBuffer, err := c.encoder.EncodeBytes(payload)
 	if err != nil {
 		c.encoder.PutBuffer(payloadBuffer)
+		c.spoolEncodeFailures.Add(1)
 
 		return err
 	}
@@ -189,37 +217,45 @@ func (c *Client) PublishBytes(ctx context.Context, topic string, payload []byte,
 	return c.publishWrapper(ctx, topic, payloadBuffer, retry)
 }
 
-func (c *Client) publishWrapper(ctx context.Context, topic string, payloadBuffer []byte, retry bool) error {
-	if len(payloadBuffer) > types.MaxMQTTPayloadSize {
-		c.encoder.PutBuffer(payloadBuffer)
+func (c *Client) publishWrapper(ctx context.Context, topic string, payload []byte, retry bool) error {
+	if len(payload) > types.MaxMQTTPayloadSize {
+		c.encoder.PutBuffer(payload)
 
-		return fmt.Errorf("%w: size is %d which is > %d", ErrPayloadTooLarge, len(payloadBuffer), types.MaxMQTTPayloadSize)
+		return fmt.Errorf("%w: size is %d which is > %d", ErrPayloadTooLarge, len(payload), types.MaxMQTTPayloadSize)
 	}
 
-	msg, ok := c.publish(topic, payloadBuffer, retry)
-
-	if ok {
-		c.opts.ReloadState.AddPendingMessage(ctx, msg, true)
-	} else {
-		c.encoder.PutBuffer(payloadBuffer)
-	}
-
-	return nil
-}
-
-func (c *Client) publish(topic string, payload []byte, retry bool) (types.Message, bool) {
 	c.l.Lock()
 	mqtt := c.mqtt
 	c.l.Unlock()
 
-	msg := types.Message{
-		Retry:   retry,
-		Payload: payload,
-		Topic:   topic,
+	// Non-retry messages with no live connection keep their historical
+	// fire-and-forget behavior: they are neither persisted nor enqueued.
+	if mqtt == nil && !retry {
+		c.encoder.PutBuffer(payload)
+
+		return nil
 	}
 
-	if mqtt == nil && !retry {
-		return msg, false
+	msg := types.Message{
+		Retry:      retry,
+		Payload:    payload,
+		Topic:      topic,
+		EnqueuedAt: time.Now(),
+	}
+
+	// Persistence happens BEFORE paho.Publish: if the process dies from this
+	// point until the broker PUBACK, the record is replayed on next start
+	// (MQTT QoS 1: at least once, duplicates are possible).
+	if retry {
+		if rs := c.concreteReloadState(); rs != nil {
+			if seq, err := rs.SpoolAppend(topic, payload, msg.EnqueuedAt); err == nil {
+				msg.SpoolSeq = seq
+			} else if !errors.Is(err, errSpoolDisabled) {
+				// Disk full or write error: don't blackhole the message,
+				// publish it memory-only; the event is counted in the spool.
+				logger.V(1).Printf("%s MQTT spool persistence unavailable for message on %s: %v", c.opts.ID, topic, err)
+			}
+		}
 	}
 
 	if mqtt != nil {
@@ -227,7 +263,27 @@ func (c *Client) publish(topic string, payload []byte, retry bool) (types.Messag
 		c.stats.messagePublished(msg.Token, time.Now())
 	}
 
-	return msg, true
+	// If the enqueue fails (caller context canceled during a blocking Put),
+	// the spool lease must be released so the record stays dispatchable on the
+	// next run: the FIFO never received the message.
+	enqueued := c.opts.ReloadState.AddPendingMessage(ctx, msg, true)
+	if !enqueued && msg.SpoolSeq != 0 {
+		if rs := c.concreteReloadState(); rs != nil {
+			rs.SpoolUnlease(msg.SpoolSeq)
+		}
+	}
+
+	return nil
+}
+
+// concreteReloadState returns the concrete *ReloadState when the interface is
+// backed by one (both the open-source and Bleemeo clients do so), nil otherwise.
+func (c *Client) concreteReloadState() *ReloadState {
+	if rs, ok := c.opts.ReloadState.(*ReloadState); ok {
+		return rs
+	}
+
+	return nil
 }
 
 // isAuthenticationError tells whether the broker refused the connection because of our credentials.
@@ -455,7 +511,88 @@ func (c *Client) ackManager(ctx context.Context) {
 	}
 }
 
+// spoolDispatchBatchSize bounds how many recovered records a feeder tick may
+// move into the in-memory FIFO.
+const spoolDispatchBatchSize = 64
+
+// spoolDispatchInterval is how often the feeder looks for recovered records.
+const spoolDispatchInterval = 200 * time.Millisecond
+
+// spoolFeeder is the unique replayer of recovered spool records. It moves
+// undispatched live records into the pending FIFO with backpressure (Put blocks
+// when the FIFO is full), where the ack manager republishes them with QoS 1.
+func (c *Client) spoolFeeder(ctx context.Context) {
+	rs := c.concreteReloadState()
+	if rs == nil {
+		return
+	}
+
+	ticker := time.NewTicker(spoolDispatchInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		msgs := rs.SpoolLease(spoolDispatchBatchSize)
+
+		for i, msg := range msgs {
+			// Token is nil: the record is published by the ack manager like any
+			// message queued while the broker was unreachable.
+			if enqueued := rs.AddPendingMessage(ctx, msg, true); !enqueued {
+				// The run ended (reload/shutdown) before this record (and the
+				// following ones) entered the FIFO: give the leases back so the
+				// next run re-dispatches them instead of stranding them as queued.
+				rs.SpoolUnlease(spoolMessageSeqs(msgs[i:])...)
+
+				return
+			}
+		}
+	}
+}
+
+func spoolMessageSeqs(msgs []types.Message) []uint64 {
+	seqs := make([]uint64, len(msgs))
+	for i, msg := range msgs {
+		seqs[i] = msg.SpoolSeq
+	}
+
+	return seqs
+}
+
 func (c *Client) ackOne(msg types.Message, timeout time.Duration) error {
+	// Records explicitly evicted by the retention/size policy, or unknown to the
+	// spool (already evicted), must never be (re)sent: explicit eviction is the
+	// only case besides acknowledgement that removes a message.
+	if msg.SpoolSeq != 0 {
+		if rs := c.concreteReloadState(); rs != nil {
+			switch rs.SpoolBeforeSend(msg.SpoolSeq) {
+			case sendDropExpired:
+				logger.V(2).Printf("%s MQTT dropping expired pending message on %s (older than retention)", c.opts.ID, msg.Topic)
+				c.encoder.PutBuffer(msg.Payload)
+
+				return nil
+			case sendDropUnknown:
+				logger.V(2).Printf("%s MQTT dropping evicted pending message on %s", c.opts.ID, msg.Topic)
+				c.encoder.PutBuffer(msg.Payload)
+
+				return nil
+			case sendRetryEviction:
+				// The eviction could not be persisted: keep payload ownership and
+				// requeue the message so the eviction is retried once I/O recovers.
+				logger.V(1).Printf("%s MQTT age eviction of message on %s could not be persisted, retrying", c.opts.ID, msg.Topic)
+				c.opts.ReloadState.AddPendingMessage(context.Background(), msg, true)
+				time.Sleep(time.Second)
+
+				return nil
+			case sendOK:
+			}
+		}
+	}
+
 	var err error
 
 	// The token is nil when publishing failed.
@@ -507,6 +644,21 @@ func (c *Client) ackOne(msg types.Message, timeout time.Duration) error {
 		}
 
 		return err
+	}
+
+	// The broker acknowledged the PUBLISH: only now may the spool record retire.
+	// If the durable RETIRE cannot be written, keep the message queued so the
+	// retirement is retried: the record must not vanish before it is retired.
+	if msg.SpoolSeq != 0 {
+		if rs := c.concreteReloadState(); rs != nil {
+			if retireErr := rs.SpoolRetire(msg.SpoolSeq); retireErr != nil {
+				logger.V(1).Printf("%s MQTT broker acknowledged message on %s but spool retirement failed, retrying: %v", c.opts.ID, msg.Topic, retireErr)
+
+				c.opts.ReloadState.AddPendingMessage(context.Background(), msg, true)
+
+				return retireErr
+			}
+		}
 	}
 
 	now := time.Now()
@@ -588,7 +740,32 @@ func (c *Client) DiagnosticArchive(_ context.Context, archive types.ArchiveWrite
 	enc := json.NewEncoder(file)
 	enc.SetIndent("", "  ")
 
-	return enc.Encode(obj)
+	if err := enc.Encode(obj); err != nil {
+		return err
+	}
+
+	file, err = archive.Create(fileID + "-mqtt-spool.json")
+	if err != nil {
+		return err
+	}
+
+	spoolObj := struct {
+		EncodeFailedEvents int64 `json:"encode_failed_events"`
+		SpoolStats
+	}{
+		EncodeFailedEvents: c.spoolEncodeFailures.Load(),
+	}
+
+	if rs := c.concreteReloadState(); rs != nil {
+		if stats, ok := rs.SpoolSnapshot(); ok {
+			spoolObj.SpoolStats = stats
+		}
+	}
+
+	spoolEnc := json.NewEncoder(file)
+	spoolEnc.SetIndent("", "  ")
+
+	return spoolEnc.Encode(spoolObj)
 }
 
 // LastReport returns the date of last acknowledgment received.

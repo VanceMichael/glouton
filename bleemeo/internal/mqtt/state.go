@@ -153,6 +153,10 @@ func (rs *reloadState) Close() {
 
 		rs.mqtt.Disconnect(5 * time.Second)
 	}
+
+	// Close the shared MQTT client reload state: it flushes and releases the
+	// persistent spool (unacknowledged records stay on disk for next start).
+	rs.clientState.Close()
 }
 
 // ClientState returns the reload state of the mqtt client.

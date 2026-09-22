@@ -138,7 +138,7 @@ func (fifo *fifo[T]) Get(ctx context.Context) (v T, open bool) {
 // If the queue is closed, Put returns without doing anything.
 // If the queue is full, Put waits until a slot is freed and
 // only returns once the value has been added.
-func (fifo *fifo[T]) Put(ctx context.Context, v T) {
+func (fifo *fifo[T]) Put(ctx context.Context, v T) bool {
 	subCtx, cancel := context.WithCancelCause(ctx)
 
 	var wg sync.WaitGroup
@@ -155,14 +155,14 @@ func (fifo *fifo[T]) Put(ctx context.Context, v T) {
 	defer fifo.l.Unlock()
 
 	if fifo.closed || ctx.Err() != nil {
-		return
+		return false
 	}
 
 	for fifo.writeReadDiff >= fifo.size {
 		fifo.notFull.Wait()
 
 		if fifo.closed || ctx.Err() != nil {
-			return
+			return false
 		}
 	}
 
@@ -175,6 +175,40 @@ func (fifo *fifo[T]) Put(ctx context.Context, v T) {
 	fifo.writeIdx++
 
 	fifo.notEmpty.Signal()
+
+	return true
+}
+
+// Drain removes and returns every queued element in FIFO order and resets the
+// queue indexes. It is used once during a reload to move the in-memory backlog
+// into the persistent spool: no consumer must be running when it is called.
+// If the queue is closed, Drain returns nil without modifying anything.
+func (fifo *fifo[T]) Drain() []T {
+	fifo.l.Lock()
+	defer fifo.l.Unlock()
+
+	if fifo.closed || fifo.writeReadDiff == 0 {
+		return nil
+	}
+
+	out := make([]T, 0, fifo.writeReadDiff)
+
+	for fifo.writeReadDiff > 0 {
+		if fifo.readIdx == fifo.size {
+			fifo.readIdx = 0
+		}
+
+		fifo.writeReadDiff--
+		v := fifo.queue[fifo.readIdx]
+		fifo.queue[fifo.readIdx] = fifo.zero
+		fifo.readIdx++
+		out = append(out, v)
+	}
+
+	fifo.readIdx = 0
+	fifo.writeIdx = 0
+
+	return out
 }
 
 // PutNoWait tries to add the given value to the queue if a slot is free.

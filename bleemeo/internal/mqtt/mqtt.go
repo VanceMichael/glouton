@@ -208,6 +208,10 @@ func New(opts Option) *Client {
 		AuthenticationErrorHandler: opts.CheckToken,
 		ID:                         "Bleemeo",
 		PahoLastPingCheckAt:        opts.PahoLastPingCheckAt,
+		SpoolEnabled:               opts.Config.Bleemeo.MQTT.Spool.Enable,
+		SpoolDirectory:             opts.Config.Agent.StateDirectory,
+		SpoolMaxSize:               opts.Config.Bleemeo.MQTT.Spool.MaxSizeBytes(),
+		SpoolMaxAge:                opts.Config.Bleemeo.MQTT.Spool.MaxAge,
 	})
 
 	return c

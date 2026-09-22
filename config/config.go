@@ -115,6 +115,9 @@ func Load(withDefault bool, loadEnviron bool, paths ...string) (Config, []Item, 
 
 	config, warnings, err := load(loader, withDefault, loadEnviron, paths...)
 
+	config.MQTT.Spool = normalizeMQTTSpool(config.MQTT.Spool, "mqtt.spool", &warnings)
+	config.Bleemeo.MQTT.Spool = normalizeMQTTSpool(config.Bleemeo.MQTT.Spool, "bleemeo.mqtt.spool", &warnings)
+
 	switch {
 	case config.Agent.StateFile != "" && config.Agent.StateDirectory == "":
 		config.Agent.StateDirectory = filepath.Dir(config.Agent.StateFile)
@@ -163,6 +166,34 @@ func isUserSet(items []Item, key string) bool {
 	}
 
 	return false
+}
+
+// normalizeMQTTSpool validates the spool configuration and falls back to the
+// default for invalid limits. A zero max_size_mb (explicitly set or missing)
+// is replaced by the default; a zero max_age means "age-based eviction
+// disabled" and is therefore kept.
+func normalizeMQTTSpool(spool MQTTSpool, configKey string, warnings *prometheus.MultiError) MQTTSpool {
+	if spool.MaxSizeMB == 0 {
+		spool.MaxSizeMB = DefaultMQTTSpoolMaxSizeMB
+	} else if spool.MaxSizeMB < 0 {
+		warnings.Append(fmt.Errorf(
+			"%w: %s.max_size_mb can't be negative, using default value %d",
+			ErrInvalidValue, configKey, DefaultMQTTSpoolMaxSizeMB,
+		))
+
+		spool.MaxSizeMB = DefaultMQTTSpoolMaxSizeMB
+	}
+
+	if spool.MaxAge < 0 {
+		warnings.Append(fmt.Errorf(
+			"%w: %s.max_age can't be negative, using default value %s",
+			ErrInvalidValue, configKey, DefaultMQTTSpoolMaxAge,
+		))
+
+		spool.MaxAge = DefaultMQTTSpoolMaxAge
+	}
+
+	return spool
 }
 
 func checkForConfigMistake(cfg Config, items []Item) prometheus.MultiError {

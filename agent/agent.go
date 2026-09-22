@@ -1433,6 +1433,7 @@ func (a *agent) run(ctx context.Context, sighupChan chan os.Signal) { //nolint:m
 		a.mqtt = mqtt.New(mqtt.Options{
 			ReloadState:         a.reloadState.MQTT(),
 			Config:              a.config.MQTT,
+			StateDirectory:      a.config.Agent.StateDirectory,
 			Store:               promFilteredStore,
 			FQDN:                fqdn,
 			PahoLastPingCheckAt: a.pahoLogWrapper.LastPingAt,

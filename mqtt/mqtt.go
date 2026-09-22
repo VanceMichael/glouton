@@ -48,6 +48,9 @@ type MQTT struct {
 type Options struct {
 	Config config.OpenSourceMQTT
 	FQDN   string
+	// StateDirectory is the agent state directory; the persistent spool (when
+	// enabled) lives under its mqtt-spool subdirectory.
+	StateDirectory string
 	// State kept between reloads.
 	ReloadState types.MQTTReloadState
 	// The store provides the metrics to send to MQTT.
@@ -77,6 +80,10 @@ func New(opts Options) *MQTT {
 		ReloadState:         opts.ReloadState,
 		ID:                  "Open Source",
 		PahoLastPingCheckAt: opts.PahoLastPingCheckAt,
+		SpoolEnabled:        opts.Config.Spool.Enable,
+		SpoolDirectory:      opts.StateDirectory,
+		SpoolMaxSize:        opts.Config.Spool.MaxSizeBytes(),
+		SpoolMaxAge:         opts.Config.Spool.MaxAge,
 	})
 
 	return &m

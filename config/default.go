@@ -46,7 +46,25 @@ const (
 
 	// defaultHTTP is the default protocol used in several config values.
 	defaultHTTP = "http"
+
+	// DefaultMQTTSpoolMaxSizeMB is the default live size cap of the persistent
+	// MQTT pending-message queue (spool) in MiB.
+	DefaultMQTTSpoolMaxSizeMB = 100
 )
+
+// DefaultMQTTSpoolMaxAge is the default retention of unacknowledged messages in
+// the persistent MQTT spool (7 days).
+var DefaultMQTTSpoolMaxAge = 7 * 24 * time.Hour
+
+// DefaultMQTTSpool returns the default spool configuration used by both the
+// open source MQTT and the Bleemeo MQTT connectors: disabled, 100 MiB, 7 days.
+func DefaultMQTTSpool() MQTTSpool {
+	return MQTTSpool{
+		Enable:    false,
+		MaxSizeMB: DefaultMQTTSpoolMaxSizeMB,
+		MaxAge:    DefaultMQTTSpoolMaxAge,
+	}
+}
 
 // DefaultPaths returns the default paths used to search for config files.
 func DefaultPaths() []string {
@@ -188,6 +206,7 @@ func DefaultConfig() Config { //nolint:maintidx
 				Port:        8883,
 				SSLInsecure: false,
 				SSL:         true,
+				Spool:       DefaultMQTTSpool(),
 			},
 			RegistrationKey: "",
 			Sentry: Sentry{
@@ -382,6 +401,7 @@ func DefaultConfig() Config { //nolint:maintidx
 			CAFile:      "",
 			SSLInsecure: false,
 			SSL:         false,
+			Spool:       DefaultMQTTSpool(),
 		},
 		NetworkInterfaceDenylist: []string{
 			"docker",
