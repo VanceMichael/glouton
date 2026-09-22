@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"runtime"
 	"slices"
@@ -52,6 +53,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
@@ -66,6 +68,7 @@ const (
 	pushedPointsCleanupInterval = 5 * time.Minute
 	hookRetryDelay              = 2 * time.Minute
 	relabelTimeout              = 20 * time.Second
+	stalePushTimeout            = 20 * time.Second
 	baseJitter                  = 0
 	maxLastScrape               = 10
 	gloutonMinimalInterval      = 10 * time.Second
@@ -205,6 +208,20 @@ type RegistrationOption struct {
 	// metric not allowed by allow_list (or metric denied) will be dropped.
 	// Currently (until Registry.renamer is dropped), this shouldn't be activated on SNMP gatherer.
 	AcceptAllowedMetricsOnly bool
+	// RetireEmittedSeries makes an explicit Unregister() emit one generation of Prometheus
+	// stale markers for every series the registration last successfully emitted (after relabel
+	// and filtering), through Option.PushPoint (i.e. the memory store and, when wired, the
+	// embedded TSDB). This prevents a removed target from keeping its last values alive in
+	// local queries via PromQL lookback.
+	//
+	// The retired set is scoped to this registration only: other registrations emitting the
+	// same metric names are never touched. It is replaced only after a fully successful
+	// scrape, so one failed/partial read or relabel hook retry keeps the previously known set.
+	//
+	// It only applies to an explicit Unregister(). Registry shutdown (Run returning), which
+	// also happens on process stop and configuration reload, never emits stale markers: the
+	// targets are not gone, they are just no longer gathered by this Registry instance.
+	RetireEmittedSeries bool
 	// HonorTimestamp indicate whether timestamp associated with each metric point is used or if a timestamp
 	// decided by the Registry is used. Using the timestamp of the registry is preferred as its more stable.
 	// If you need mixed timestamp decided by the Registry and timestamp associated with some points, use a
@@ -336,6 +353,16 @@ type registration struct {
 	hookMinimalInterval  time.Duration
 	interval             time.Duration
 	lastErrorLogAt       time.Time
+	// emittedSeries holds the label sets of every series this registration last successfully
+	// pushed (after relabel, thresholds and filtering), keyed by labels hash. It is only
+	// maintained when option.RetireEmittedSeries is set, and only replaced on a fully
+	// successful scrape+relabel run, so a failed scrape keeps the previous ownership set.
+	emittedSeries map[uint64]labels.Labels
+	// lastScrapeFailed tracks whether the previous scrape/relabel run failed, to log the
+	// recovery (the next successful run) as an observable event.
+	lastScrapeFailed bool
+	// keptOwnershipOnFailedScrape counts failed runs that kept a non-empty emittedSeries.
+	keptOwnershipOnFailedScrape int
 }
 
 // runNow will trigger a run of the scrapeLoop. If the registry isn't running,
@@ -950,21 +977,29 @@ func (r *Registry) diagnosticScrapeLoop(ctx context.Context, archive types.Archi
 	}
 
 	type loopInfo struct {
-		ID                  int
-		Description         string
-		AddedAt             time.Time
-		LastScrape          []scrapeRun
-		RegInterval         string
-		HookMinimalInterval string
-		ScrapeInterval      string
-		Option              RegistrationOption
-		RegistrationType    string
-		UnexportableOption  unexportableOption
-		LabelUsed           map[string]string
-		LabelsWithMeta      map[string]string
-		RelabelHookSkip     bool
-		RelabelHookLastTry  time.Time
-		subDiagnostic       func(ctx context.Context, archive types.ArchiveWriter) error
+		ID                          int
+		Description                 string
+		AddedAt                     time.Time
+		LastScrape                  []scrapeRun
+		RegInterval                 string
+		HookMinimalInterval         string
+		ScrapeInterval              string
+		Option                      RegistrationOption
+		RegistrationType            string
+		UnexportableOption          unexportableOption
+		LabelUsed                   map[string]string
+		LabelsWithMeta              map[string]string
+		RelabelHookSkip             bool
+		RelabelHookLastTry          time.Time
+		// EmittedSeries is the number of series currently owned by the registration, i.e.
+		// that an explicit Unregister() would converge with stale markers.
+		EmittedSeries int
+		// LastScrapeFailed tells whether the last scrape/relabel run failed and ownership
+		// was retained from the previous successful run.
+		LastScrapeFailed bool
+		// KeptOwnershipOnFailedScrape counts failed runs that retained a non-empty ownership set.
+		KeptOwnershipOnFailedScrape int
+		subDiagnostic               func(ctx context.Context, archive types.ArchiveWriter) error
 	}
 
 	activeResult := []loopInfo{}
@@ -982,10 +1017,13 @@ func (r *Registry) diagnosticScrapeLoop(ctx context.Context, archive types.Archi
 			HookMinimalInterval: reg.hookMinimalInterval.String(),
 			Option:              reg.option,
 			RegistrationType:    reg.regType.String(),
-			LabelUsed:           dtoLabelToMap(reg.gatherer.labels),
-			LabelsWithMeta:      reg.labelsWithMeta,
-			RelabelHookSkip:     reg.relabelHookSkip,
-			RelabelHookLastTry:  reg.lastRelabelHookRetry,
+			LabelUsed:                   dtoLabelToMap(reg.gatherer.labels),
+			LabelsWithMeta:              reg.labelsWithMeta,
+			RelabelHookSkip:             reg.relabelHookSkip,
+			RelabelHookLastTry:          reg.lastRelabelHookRetry,
+			EmittedSeries:               len(reg.emittedSeries),
+			LastScrapeFailed:            reg.lastScrapeFailed,
+			KeptOwnershipOnFailedScrape: reg.keptOwnershipOnFailedScrape,
 		}
 
 		if reg.option.StopCallback != nil {
@@ -1307,7 +1345,120 @@ func (r *Registry) unregister(reg *registration) {
 
 	r.unregisterInner(reg)
 
+	// The scrape loop is now stopped (no more points can be emitted by this registration),
+	// so it is safe to converge its last known series with stale markers. The stop in
+	// unregisterInner is what makes the stale generation consistent: no successful sample
+	// from the old identity can race it afterwards.
+	if reg.option.RetireEmittedSeries {
+		r.retireRegistrationSeries(reg)
+	}
+
 	logger.V(2).Printf("Unregister with registration_id=%d called, description=%v (started at %v)", id, reg.option.Description, startAt)
+}
+
+// retireRegistrationSeries sends one generation of Prometheus stale markers (StaleNaN) for
+// every series the registration last successfully emitted, through the regular point pusher,
+// which tees to the memory store and the embedded TSDB when both are configured. Both backends
+// therefore stop exposing the old values at the same timestamp, and PromQL lookback can't
+// resurrect them.
+//
+// Only series actually emitted after relabel/filter are retired, and only those owned by this
+// registration: another registration that happens to use the same metric names is not touched.
+// This is used by dynamic (discovered) targets being removed or replaced; the registry
+// shutdown path calls unregisterInner directly and never reaches here.
+func (r *Registry) retireRegistrationSeries(reg *registration) {
+	reg.l.Lock()
+	owned := reg.emittedSeries
+	reg.emittedSeries = nil
+	reg.l.Unlock()
+
+	if r.option.PushPoint == nil {
+		return
+	}
+
+	if len(owned) == 0 {
+		logger.V(2).Printf("No successfully emitted series to retire for %q", reg.option.Description)
+
+		return
+	}
+
+	// One timestamp for the whole batch makes it a single stale generation for both stores.
+	staleAt := time.Now()
+	points := make([]types.MetricPoint, 0, len(owned))
+
+	for _, lbls := range owned {
+		points = append(points, types.MetricPoint{
+			Labels: lbls.Map(),
+			Point: types.Point{
+				Time:  staleAt,
+				Value: math.Float64frombits(value.StaleNaN),
+			},
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), stalePushTimeout)
+	defer cancel()
+
+	r.option.PushPoint.PushPoints(ctx, points)
+
+	logger.V(1).Printf(
+		"Retired %d emitted series of %q with stale markers at %s (authoritative target removal/replacement)",
+		len(points), reg.option.Description, staleAt.Format(time.RFC3339Nano),
+	)
+}
+
+// updateRegistrationSeriesOwnership replaces the set of series considered owned by this
+// registration with the series that were actually emitted on this successful scrape run
+// (after relabel, thresholds and filtering).
+//
+// On a failed scrape/read or a relabel hook retry, the previous set is retained instead:
+// one incomplete discovery or transient failure must not shrink ownership and make a later
+// Unregister miss series (leaving stale lookback values) or retire the wrong set. The next
+// successful run replaces the set, which is observable through the recovery log line.
+func (r *Registry) updateRegistrationSeriesOwnership(reg *registration, points []types.MetricPoint, scrapeErr error) {
+	reg.l.Lock()
+	defer reg.l.Unlock()
+
+	if scrapeErr != nil {
+		reg.lastScrapeFailed = true
+
+		if len(reg.emittedSeries) > 0 {
+			reg.keptOwnershipOnFailedScrape++
+
+			logger.V(2).Printf(
+				"Scrape of %q failed (%v); keeping the %d series from the last successful scrape as owned, next successful run will update the set",
+				reg.option.Description, scrapeErr, len(reg.emittedSeries),
+			)
+		}
+
+		return
+	}
+
+	recovered := reg.lastScrapeFailed
+	reg.lastScrapeFailed = false
+
+	newSet := make(map[uint64]labels.Labels, len(points))
+
+	for _, point := range points {
+		lbls := labels.FromMap(point.Labels)
+		newSet[lbls.Hash()] = lbls
+	}
+
+	oldCount := len(reg.emittedSeries)
+	reg.emittedSeries = newSet
+
+	switch {
+	case recovered:
+		logger.V(1).Printf(
+			"Scrape of %q recovered after a failure; emitted-series ownership updated to %d series",
+			reg.option.Description, len(newSet),
+		)
+	case oldCount != len(newSet):
+		logger.V(2).Printf(
+			"Emitted-series ownership of %q updated: %d -> %d series",
+			reg.option.Description, oldCount, len(newSet),
+		)
+	}
 }
 
 func (r *Registry) unregisterInner(reg *registration) {
@@ -1377,7 +1528,7 @@ func (r *Registry) GatherWithState(ctx context.Context, state GatherState) ([]*d
 			scrapedPoints := gloutonModel.FamiliesToMetricPoints(time.Time{}, scrapedMFS, !reg.option.ApplyDynamicRelabel)
 
 			if reg.option.ApplyDynamicRelabel {
-				scrapedPoints = r.relabelPoints(ctx, scrapedPoints)
+				scrapedPoints, _ = r.relabelPoints(ctx, scrapedPoints)
 			}
 
 			// Apply the thresholds after relabeling to get the instance UUID in the labels.
@@ -1670,6 +1821,10 @@ func (r *Registry) scrapeFromLoop(ctx context.Context, loopCtx context.Context, 
 
 	reg.lastScrapes = append(reg.lastScrapes, scrapeRun{ScrapeAt: t0, ScrapeDuration: duration, ScrapedPointsCount: len(mfs), Error: err})
 
+	// scrapeErr is captured before the relabel-hook skip is swallowed below: ownership
+	// tracking must see the skip as a failure and retain the previous emitted-series set.
+	scrapeErr := err
+
 	if errors.Is(err, errSkippingScrapeDueToRelabelHook) {
 		// We don't log skipping due to relabel hook, but we still store the error in reg.lastScrapes
 		err = nil
@@ -1729,7 +1884,15 @@ func (r *Registry) scrapeFromLoop(ctx context.Context, loopCtx context.Context, 
 	}
 
 	if reg.option.ApplyDynamicRelabel {
-		points = r.relabelPoints(ctx, points)
+		var relabelHookRetried int
+
+		points, relabelHookRetried = r.relabelPoints(ctx, points)
+
+		if reg.option.RetireEmittedSeries && relabelHookRetried > 0 {
+			// A relabel hook asking to retry is not a successful run: retain the previous
+			// ownership set so the points aren't falsely treated as gone.
+			scrapeErr = fmt.Errorf("%w: relabel hook asked to retry for %d point(s)", errSkippingScrapeDueToRelabelHook, relabelHookRetried)
+		}
 	}
 
 	// Apply the thresholds after relabeling to get the instance UUID in the labels.
@@ -1742,6 +1905,13 @@ func (r *Registry) scrapeFromLoop(ctx context.Context, loopCtx context.Context, 
 
 	if reg.option.AcceptAllowedMetricsOnly {
 		points = r.option.Filter.FilterPoints(points)
+	}
+
+	// Track the series actually emitted by this registration only when it opted in.
+	// On a failed scrape/relabel run the previous set is retained; a later successful
+	// run replaces it, which is what a later Unregister will retire.
+	if reg.option.RetireEmittedSeries {
+		r.updateRegistrationSeriesOwnership(reg, points, scrapeErr)
 	}
 
 	if len(points) > 0 && r.option.PushPoint != nil {
@@ -1979,24 +2149,32 @@ func (r *Registry) addMetaLabels(input map[string]string, opts RegistrationOptio
 	return result
 }
 
-func (r *Registry) relabelPoints(ctx context.Context, points []types.MetricPoint) []types.MetricPoint {
+func (r *Registry) relabelPoints(ctx context.Context, points []types.MetricPoint) ([]types.MetricPoint, int) {
 	n := 0
+
+	hookRetried := 0
 
 	for _, point := range points {
 		ctx, cancel := context.WithTimeout(ctx, relabelTimeout)
 		defer cancel()
 
-		newLabels, _, newAnnotations, skip := r.applyRelabel(ctx, point.Labels)
+		newLabels, _, newAnnotations, retryLater := r.applyRelabel(ctx, point.Labels)
 		point.Labels = newLabels.Map()
 		point.Annotations = point.Annotations.Merge(newAnnotations)
 
-		if !skip {
-			points[n] = point
-			n++
+		if retryLater {
+			// The relabel hook isn't able to process these labels yet; the point is dropped
+			// for this run and the caller treats it as a failed run for ownership tracking.
+			hookRetried++
+
+			continue
 		}
+
+		points[n] = point
+		n++
 	}
 
-	return points[:n]
+	return points[:n], hookRetried
 }
 
 func (r *Registry) applyRelabel(

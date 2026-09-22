@@ -2116,49 +2116,55 @@ func (a *agent) updatedDiscovery(ctx context.Context, services []discovery.Servi
 		}
 	}
 
-	if a.dynamicScrapper != nil {
-		if containers, err := a.containerRuntime.Containers(ctx, time.Hour, false); err == nil {
-			a.dynamicScrapper.Update(containers)
-		}
-	}
-
-	if a.logProcessManager != nil || a.receiverManager != nil {
-		containers, _, containersMayForgetAbsent, err := a.containerRuntime.EnumerateContainers(ctx, time.Hour, false)
+	// A single EnumerateContainers call feeds the dynamic Prometheus scrapper and the log
+	// receivers: they all need the same complete/mayForgetAbsent semantics from the runtime.
+	if a.dynamicScrapper != nil || a.logProcessManager != nil || a.receiverManager != nil {
+		containers, containersComplete, containersMayForgetAbsent, err := a.containerRuntime.EnumerateContainers(ctx, time.Hour, false)
 		if err != nil {
-			// Must not fall through with containers == nil below: both UpdateContainers and
-			// HandleLogsFromDynamicSources treat an empty/nil list as "every previously-tracked
-			// container is gone", which forgets their persisted read offsets for good (see
+			// Must not fall through with containers == nil below: an empty/nil list means
+			// "every previously-tracked target/container is gone": the dynamic scrapper would
+			// unregister exporters and emit stale markers for their series, and both log
+			// managers would forget persisted read offsets for good (see
 			// ReceiverManager.updateLabelContainers/stopUnwantedContainerTails and
-			// logprocessing.Manager.removeOldSources) -- on a transient error that's a real, permanent
-			// loss of file position (fileconsumer's StartAt defaults to "end", not "beginning"), not
-			// just a delayed update. Skip this cycle instead and retry on the next one, like the
-			// dynamicScrapper.Update call above already does.
+			// logprocessing.Manager.removeOldSources) -- on a transient error that's either a
+			// false authoritative retirement or a permanent loss of file position
+			// (fileconsumer's StartAt defaults to "end", not "beginning"), not just a delayed
+			// update. Skip this cycle instead and retry on the next one.
 			logger.V(1).Printf("Failed to retrieve containers: %v", err)
 		} else {
-			// logProcessManager must run first, so that by the time UpdateContainers below asks it
-			// (through WantSource) whether it wants a container's glouton.*-label log source, its own
-			// service-path tails for this cycle already exist and it can decline the ones it would
-			// otherwise ship twice. logprocessing.Manager separately consults
-			// receiverManager.ContainerIDsShippedByReceivers on the way in, so an explicit
-			// container_name/container_selectors receiver still wins over service auto-discovery.
-			var serviceTailed map[string]bool
-
-			if a.logProcessManager != nil {
-				// Per-service-type log format auto-detection still depends on
-				// auto_discovery.container_and_service_enable, as before.
-				var logServices []discovery.Service
-				if a.config.Log.OpenTelemetry.AutoDiscovery.ContainerAndServiceEnable {
-					logServices = services
-				}
-
-				a.logProcessManager.HandleLogsFromDynamicSources(ctx, logServices, containers, containersMayForgetAbsent)
-				serviceTailed = a.logProcessManager.ServiceTailedContainerIDs()
+			if a.dynamicScrapper != nil {
+				// The scrapper only retires exporters absent from an authoritative snapshot
+				// (mayForgetAbsent=true); an incomplete snapshot keeps them and their last
+				// successfully scraped series until the next complete enumeration.
+				a.dynamicScrapper.Update(containers, containersComplete, containersMayForgetAbsent)
 			}
 
-			// receiverManager resolves container_name/container_selectors matches and
-			// glouton.* label opt-ins itself, so it needs the full container list.
-			if a.receiverManager != nil {
-				a.receiverManager.UpdateContainers(ctx, containers, serviceTailed, containersMayForgetAbsent)
+			if a.logProcessManager != nil || a.receiverManager != nil {
+				// logProcessManager must run first, so that by the time UpdateContainers below asks it
+				// (through WantSource) whether it wants a container's glouton.*-label log source, its own
+				// service-path tails for this cycle already exist and it can decline the ones it would
+				// otherwise ship twice. logprocessing.Manager separately consults
+				// receiverManager.ContainerIDsShippedByReceivers on the way in, so an explicit
+				// container_name/container_selectors receiver still wins over service auto-discovery.
+				var serviceTailed map[string]bool
+
+				if a.logProcessManager != nil {
+					// Per-service-type log format auto-detection still depends on
+					// auto_discovery.container_and_service_enable, as before.
+					var logServices []discovery.Service
+					if a.config.Log.OpenTelemetry.AutoDiscovery.ContainerAndServiceEnable {
+						logServices = services
+					}
+
+					a.logProcessManager.HandleLogsFromDynamicSources(ctx, logServices, containers, containersMayForgetAbsent)
+					serviceTailed = a.logProcessManager.ServiceTailedContainerIDs()
+				}
+
+				// receiverManager resolves container_name/container_selectors matches and
+				// glouton.* label opt-ins itself, so it needs the full container list.
+				if a.receiverManager != nil {
+					a.receiverManager.UpdateContainers(ctx, containers, serviceTailed, containersMayForgetAbsent)
+				}
 			}
 		}
 	}
